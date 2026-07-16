@@ -1053,6 +1053,13 @@ const CORNER_RADIUS: i32 = 2;
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
+const LOGO_SIZE: i32 = 13;
+const LOGO_RIGHT_MARGIN: i32 = 4;
+
+const LOGO_MASK_SIZE: usize = 64;
+static CLAUDE_LOGO_MASK: &[u8] = include_bytes!("logo_masks/claude.alpha");
+static CODEX_LOGO_MASK: &[u8] = include_bytes!("logo_masks/openai.alpha");
+static ANTIGRAVITY_LOGO_MASK: &[u8] = include_bytes!("logo_masks/antigravity.alpha");
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
@@ -1093,9 +1100,7 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
 
 fn total_widget_width_for(active_models: i32) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+    let model_width = model_usage_width(bar_segments);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
@@ -1727,6 +1732,7 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            bg,
         );
         draw_row(
             hdc,
@@ -1748,6 +1754,7 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            bg,
         );
 
         SelectObject(hdc, old_font);
@@ -3103,6 +3110,7 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    bg: &Color,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
@@ -3141,10 +3149,20 @@ fn draw_row(
         );
 
         let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let logo_advance = sc(LOGO_SIZE) + sc(LOGO_RIGHT_MARGIN);
         if show_claude_code {
-            draw_usage_bar(
+            draw_logo(
                 hdc,
                 model_x,
+                y,
+                sc(LOGO_SIZE),
+                CLAUDE_LOGO_MASK,
+                claude_accent,
+                bg,
+            );
+            draw_usage_bar(
+                hdc,
+                model_x + logo_advance,
                 y,
                 segment_count,
                 claude_percent,
@@ -3156,9 +3174,18 @@ fn draw_row(
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
-            draw_usage_bar(
+            draw_logo(
                 hdc,
                 model_x,
+                y,
+                sc(LOGO_SIZE),
+                CODEX_LOGO_MASK,
+                codex_accent,
+                bg,
+            );
+            draw_usage_bar(
+                hdc,
+                model_x + logo_advance,
                 y,
                 segment_count,
                 codex_percent,
@@ -3170,9 +3197,18 @@ fn draw_row(
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
-            draw_usage_bar(
+            draw_logo(
                 hdc,
                 model_x,
+                y,
+                sc(LOGO_SIZE),
+                ANTIGRAVITY_LOGO_MASK,
+                antigravity_accent,
+                bg,
+            );
+            draw_usage_bar(
+                hdc,
+                model_x + logo_advance,
                 y,
                 segment_count,
                 antigravity_percent,
@@ -3186,9 +3222,54 @@ fn draw_row(
 }
 
 fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+    sc(LOGO_SIZE)
+        + sc(LOGO_RIGHT_MARGIN)
+        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
+        - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH)
+}
+
+/// Draw a provider logo by downscaling a 64x64 alpha mask with a box filter
+/// and blending `tint` over `bg` per pixel. The widget background is a solid
+/// fill, so blending against `bg` matches what AlphaBlend would produce.
+fn draw_logo(hdc: HDC, x: i32, y: i32, size: i32, mask: &[u8], tint: &Color, bg: &Color) {
+    if size <= 0 {
+        return;
+    }
+    let scale = LOGO_MASK_SIZE as f64 / size as f64;
+    unsafe {
+        for py in 0..size {
+            let y0 = (py as f64 * scale) as usize;
+            let y1 = (((py + 1) as f64 * scale).ceil() as usize).min(LOGO_MASK_SIZE);
+            for px in 0..size {
+                let x0 = (px as f64 * scale) as usize;
+                let x1 = (((px + 1) as f64 * scale).ceil() as usize).min(LOGO_MASK_SIZE);
+                let mut sum: u32 = 0;
+                let mut count: u32 = 0;
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        sum += mask[sy * LOGO_MASK_SIZE + sx] as u32;
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    continue;
+                }
+                let a = sum / count;
+                if a == 0 {
+                    continue;
+                }
+                let blend = |t: u8, b: u8| ((t as u32 * a + b as u32 * (255 - a)) / 255) as u8;
+                let color = native_interop::colorref(
+                    blend(tint.r, bg.r),
+                    blend(tint.g, bg.g),
+                    blend(tint.b, bg.b),
+                );
+                let _ = SetPixelV(hdc, x + px, y + py, COLORREF(color));
+            }
+        }
+    }
 }
 
 fn draw_usage_bar(
