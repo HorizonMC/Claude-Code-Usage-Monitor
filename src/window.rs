@@ -59,6 +59,8 @@ struct AppState {
     session_text: String,
     weekly_percent: f64,
     weekly_text: String,
+    fable_weekly_percent: f64,
+    fable_weekly_text: String,
     codex_session_percent: f64,
     codex_session_text: String,
     codex_weekly_percent: f64,
@@ -68,6 +70,7 @@ struct AppState {
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
     show_claude_code: bool,
+    show_fable: bool,
     show_codex: bool,
     show_antigravity: bool,
 
@@ -312,6 +315,8 @@ struct SettingsFile {
     widget_visible: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
+    #[serde(default = "default_show_fable")]
+    show_fable: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
@@ -328,6 +333,7 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: true,
+            show_fable: true,
             show_codex: false,
             show_antigravity: false,
         }
@@ -343,6 +349,10 @@ fn default_widget_visible() -> bool {
 }
 
 fn default_show_claude_code() -> bool {
+    true
+}
+
+fn default_show_fable() -> bool {
     true
 }
 
@@ -389,6 +399,7 @@ fn save_state_settings() {
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
+            show_fable: s.show_fable,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
         });
@@ -401,15 +412,19 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
         Some(s) if s.last_poll_ok => {
             let mut icons = Vec::new();
             if s.show_claude_code {
+                let mut tooltip = format!(
+                    "{} 5h: {} | 7d: {}",
+                    s.language.strings().claude_code_model,
+                    s.session_text,
+                    s.weekly_text
+                );
+                if s.show_fable {
+                    tooltip.push_str(&format!(" | Fable 7d: {}", s.fable_weekly_text));
+                }
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
                     percent: Some(s.session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
-                    ),
+                    tooltip,
                 });
             }
             if s.show_codex {
@@ -647,9 +662,14 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(claude_code) = data.claude_code.as_ref() {
         state.session_text = poller::format_line(&claude_code.session, strings);
         state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        state.fable_weekly_text = match claude_code.model_weekly.as_ref() {
+            Some(section) => poller::format_line(section, strings),
+            None => "--".to_string(),
+        };
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
+        state.fable_weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
@@ -1086,8 +1106,14 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn active_model_count(
+    show_claude_code: bool,
+    show_fable: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) -> i32 {
+    let fable_column = (show_claude_code && show_fable) as i32;
+    (show_claude_code as i32 + fable_column + show_codex as i32 + show_antigravity as i32).max(1)
 }
 
 fn row_bar_segment_count(active_models: i32) -> i32 {
@@ -1114,6 +1140,7 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 fn total_widget_width_for_state(state: &AppState) -> i32 {
     total_widget_width_for(active_model_count(
         state.show_claude_code,
+        state.show_fable,
         state.show_codex,
         state.show_antigravity,
     ))
@@ -1124,7 +1151,9 @@ fn total_widget_width() -> i32 {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
+            .map(|s| {
+                active_model_count(s.show_claude_code, s.show_fable, s.show_codex, s.show_antigravity)
+            })
             .unwrap_or(1)
     };
     total_widget_width_for(active_models)
@@ -1144,6 +1173,14 @@ fn codex_accent_color(is_dark: bool) -> Color {
 
 fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
+}
+
+fn fable_accent_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#F09A7A")
+    } else {
+        Color::from_hex("#A94F32")
+    }
 }
 
 fn claude_usage_text_color(is_dark: bool) -> Color {
@@ -1247,6 +1284,7 @@ pub fn run() {
         let title = native_interop::wide_str(language.strings().window_title);
         let initial_model_count = active_model_count(
             settings.show_claude_code,
+            settings.show_fable,
             settings.show_codex,
             settings.show_antigravity,
         );
@@ -1304,6 +1342,8 @@ pub fn run() {
                 session_text: "--".to_string(),
                 weekly_percent: 0.0,
                 weekly_text: "--".to_string(),
+                fable_weekly_percent: 0.0,
+                fable_weekly_text: "--".to_string(),
                 codex_session_percent: 0.0,
                 codex_session_text: "--".to_string(),
                 codex_weekly_percent: 0.0,
@@ -1313,6 +1353,7 @@ pub fn run() {
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
                 show_claude_code: settings.show_claude_code,
+                show_fable: settings.show_fable,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
                 data: None,
@@ -1429,6 +1470,8 @@ fn render_layered() {
         session_text,
         weekly_pct,
         weekly_text,
+        fable_weekly_pct,
+        fable_weekly_text,
         codex_session_pct,
         codex_session_text,
         codex_weekly_pct,
@@ -1438,6 +1481,7 @@ fn render_layered() {
         antigravity_weekly_pct,
         antigravity_weekly_text,
         show_claude_code,
+        show_fable,
         show_codex,
         show_antigravity,
     ) = {
@@ -1452,6 +1496,8 @@ fn render_layered() {
                 s.session_text.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
+                s.fable_weekly_percent,
+                s.fable_weekly_text.clone(),
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
                 s.codex_weekly_percent,
@@ -1461,6 +1507,7 @@ fn render_layered() {
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
+                s.show_fable,
                 s.show_codex,
                 s.show_antigravity,
             ),
@@ -1547,6 +1594,8 @@ fn render_layered() {
             &session_text,
             weekly_pct,
             &weekly_text,
+            fable_weekly_pct,
+            &fable_weekly_text,
             codex_session_pct,
             &codex_session_text,
             codex_weekly_pct,
@@ -1556,6 +1605,7 @@ fn render_layered() {
             antigravity_weekly_pct,
             &antigravity_weekly_text,
             show_claude_code,
+            show_fable,
             show_codex,
             show_antigravity,
             &codex_accent,
@@ -1623,6 +1673,8 @@ fn paint_content(
     session_text: &str,
     weekly_pct: f64,
     weekly_text: &str,
+    fable_weekly_pct: f64,
+    fable_weekly_text: &str,
     codex_session_pct: f64,
     codex_session_text: &str,
     codex_weekly_pct: f64,
@@ -1632,6 +1684,7 @@ fn paint_content(
     antigravity_weekly_pct: f64,
     antigravity_weekly_text: &str,
     show_claude_code: bool,
+    show_fable: bool,
     show_codex: bool,
     show_antigravity: bool,
     codex_accent: &Color,
@@ -1721,11 +1774,13 @@ fn paint_content(
             strings.session_window,
             session_pct,
             session_text,
+            None,
             codex_session_pct,
             codex_session_text,
             antigravity_session_pct,
             antigravity_session_text,
             show_claude_code,
+            show_fable,
             show_codex,
             show_antigravity,
             accent,
@@ -1743,11 +1798,13 @@ fn paint_content(
             strings.weekly_window,
             weekly_pct,
             weekly_text,
+            Some((fable_weekly_pct, fable_weekly_text)),
             codex_weekly_pct,
             codex_weekly_text,
             antigravity_weekly_pct,
             antigravity_weekly_text,
             show_claude_code,
+            show_fable,
             show_codex,
             show_antigravity,
             accent,
@@ -1779,9 +1836,15 @@ fn do_poll(send_hwnd: SendHwnd) {
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
+                    s.fable_weekly_percent = claude_code
+                        .model_weekly
+                        .as_ref()
+                        .map(|section| section.percentage)
+                        .unwrap_or(0.0);
                 } else if s.show_claude_code {
                     s.session_percent = 0.0;
                     s.weekly_percent = 0.0;
+                    s.fable_weekly_percent = 0.0;
                 }
                 if let Some(codex) = data.codex.as_ref() {
                     s.codex_session_percent = codex.session.percentage;
@@ -2983,6 +3046,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
         session_text,
         weekly_pct,
         weekly_text,
+        fable_weekly_pct,
+        fable_weekly_text,
         codex_session_pct,
         codex_session_text,
         codex_weekly_pct,
@@ -2992,6 +3057,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_weekly_pct,
         antigravity_weekly_text,
         show_claude_code,
+        show_fable,
         show_codex,
         show_antigravity,
     ) = {
@@ -3004,6 +3070,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.session_text.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
+                s.fable_weekly_percent,
+                s.fable_weekly_text.clone(),
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
                 s.codex_weekly_percent,
@@ -3013,6 +3081,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
+                s.show_fable,
                 s.show_codex,
                 s.show_antigravity,
             ),
@@ -3067,6 +3136,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &session_text,
             weekly_pct,
             &weekly_text,
+            fable_weekly_pct,
+            &fable_weekly_text,
             codex_session_pct,
             &codex_session_text,
             codex_weekly_pct,
@@ -3076,6 +3147,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             antigravity_weekly_pct,
             &antigravity_weekly_text,
             show_claude_code,
+            show_fable,
             show_codex,
             show_antigravity,
             &codex_accent,
@@ -3099,11 +3171,13 @@ fn draw_row(
     label: &str,
     claude_percent: f64,
     claude_text: &str,
+    fable: Option<(f64, &str)>,
     codex_percent: f64,
     codex_text: &str,
     antigravity_percent: f64,
     antigravity_text: &str,
     show_claude_code: bool,
+    show_fable: bool,
     show_codex: bool,
     show_antigravity: bool,
     claude_accent: &Color,
@@ -3113,7 +3187,8 @@ fn draw_row(
     bg: &Color,
 ) {
     let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let active_models =
+        active_model_count(show_claude_code, show_fable, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1;
     let claude_value_color = if use_model_text_colors {
@@ -3170,6 +3245,33 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+            );
+            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_claude_code && show_fable {
+            let fable_accent = fable_accent_color(is_dark);
+            draw_logo(
+                hdc,
+                model_x,
+                y,
+                sc(LOGO_SIZE),
+                CLAUDE_LOGO_MASK,
+                &fable_accent,
+                bg,
+            );
+            // Fable only has a model-scoped weekly cap; its 5-hour usage is
+            // part of the shared session window, so the session row shows "--".
+            let (fable_percent, fable_text) = fable.unwrap_or((0.0, "--"));
+            draw_usage_bar(
+                hdc,
+                model_x + logo_advance,
+                y,
+                segment_count,
+                fable_percent,
+                fable_text,
+                &fable_accent,
+                track,
+                &fable_accent,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
