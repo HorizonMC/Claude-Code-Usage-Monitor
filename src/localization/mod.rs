@@ -166,7 +166,11 @@ pub struct Strings {
     pub update_prompt_now: &'static str,
     pub exit: &'static str,
     pub show_widget: &'static str,
+    // Kept for locale-table completeness; bar labels are now drawn from
+    // CLAUDE_BAR_LABELS in window.rs instead of these strings.
+    #[allow(dead_code)]
     pub session_window: &'static str,
+    #[allow(dead_code)]
     pub weekly_window: &'static str,
     pub now: &'static str,
     pub day_suffix: &'static str,

@@ -1072,20 +1072,23 @@ fn set_startup_enabled(enable: bool) {
 const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
-const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const LABEL_WIDTH: i32 = 18;
 const LOGO_SIZE: i32 = 13;
 const LOGO_RIGHT_MARGIN: i32 = 4;
+
+const SEGMENTS_PER_BAR: i32 = 4;
+const PROVIDER_GAP: i32 = 14;
+const BAR_LABEL_SHORT_W: i32 = 20;
+const BAR_LABEL_LONG_W: i32 = 36;
+const CLAUDE_BAR_LABELS: [&str; 3] = ["5h", "Wk", "Fable"];
 
 const LOGO_MASK_SIZE: usize = 64;
 static CLAUDE_LOGO_MASK: &[u8] = include_bytes!("logo_masks/claude.alpha");
 static CODEX_LOGO_MASK: &[u8] = include_bytes!("logo_masks/openai.alpha");
 static ANTIGRAVITY_LOGO_MASK: &[u8] = include_bytes!("logo_masks/antigravity.alpha");
-const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
 const MODEL_RIGHT_MARGIN: i32 = 3;
@@ -1111,57 +1114,80 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(
+fn bar_label_width(label: &str) -> i32 {
+    if label.chars().count() > 2 {
+        BAR_LABEL_LONG_W
+    } else {
+        BAR_LABEL_SHORT_W
+    }
+}
+
+fn bar_track_width() -> i32 {
+    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * SEGMENTS_PER_BAR - sc(SEGMENT_GAP)
+}
+
+fn bar_slot_width(label: &str) -> i32 {
+    sc(bar_label_width(label)) + bar_track_width() + sc(BAR_RIGHT_MARGIN) + sc(TEXT_WIDTH)
+}
+
+fn provider_section_width(labels: &[&str]) -> i32 {
+    sc(LOGO_SIZE)
+        + sc(LOGO_RIGHT_MARGIN)
+        + labels.iter().map(|label| bar_slot_width(label)).sum::<i32>()
+        + sc(MODEL_RIGHT_MARGIN) * (labels.len() as i32 - 1).max(0)
+}
+
+/// Row 1 holds the first visible provider's labeled bars; row 2 holds the
+/// remaining providers side by side. Width reserves every possible bar slot
+/// so it stays constant while data-dependent bars ("--") come and go.
+fn total_widget_width_for_flags(
     show_claude_code: bool,
     show_fable: bool,
     show_codex: bool,
     show_antigravity: bool,
 ) -> i32 {
-    let fable_column = (show_claude_code && show_fable) as i32;
-    (show_claude_code as i32 + fable_column + show_codex as i32 + show_antigravity as i32).max(1)
-}
-
-fn row_bar_segment_count(active_models: i32) -> i32 {
-    match active_models {
-        1 => SEGMENT_COUNT,
-        2 => 5,
-        _ => 4,
+    let claude_labels: &[&str] = if show_fable {
+        &CLAUDE_BAR_LABELS
+    } else {
+        &CLAUDE_BAR_LABELS[..2]
+    };
+    let mut sections = Vec::new();
+    if show_claude_code {
+        sections.push(provider_section_width(claude_labels));
     }
-}
-
-fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let model_width = model_usage_width(bar_segments);
-
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+    if show_codex {
+        sections.push(provider_section_width(&CLAUDE_BAR_LABELS[..2]));
+    }
+    if show_antigravity {
+        sections.push(provider_section_width(&CLAUDE_BAR_LABELS[..2]));
+    }
+    if sections.is_empty() {
+        sections.push(provider_section_width(&CLAUDE_BAR_LABELS[..2]));
+    }
+    let row1 = sections[0];
+    let row2: i32 = if sections.len() > 1 {
+        sections[1..].iter().sum::<i32>() + sc(PROVIDER_GAP) * (sections.len() as i32 - 2)
+    } else {
+        0
+    };
+    sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + row1.max(row2) + sc(RIGHT_MARGIN)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
+    total_widget_width_for_flags(
         state.show_claude_code,
         state.show_fable,
         state.show_codex,
         state.show_antigravity,
-    ))
+    )
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                active_model_count(s.show_claude_code, s.show_fable, s.show_codex, s.show_antigravity)
-            })
-            .unwrap_or(1)
-    };
-    total_widget_width_for(active_models)
+    let state = lock_state();
+    state
+        .as_ref()
+        .map(total_widget_width_for_state)
+        .unwrap_or_else(|| total_widget_width_for_flags(true, true, false, false))
 }
 
 fn claude_accent_color() -> Color {
@@ -1287,7 +1313,7 @@ pub fn run() {
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count = active_model_count(
+        let initial_width = total_widget_width_for_flags(
             settings.show_claude_code,
             settings.show_fable,
             settings.show_codex,
@@ -1300,7 +1326,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            initial_width,
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1673,7 +1699,7 @@ fn paint_content(
     text_color: &Color,
     accent: &Color,
     track: &Color,
-    strings: Strings,
+    _strings: Strings,
     session_pct: f64,
     session_text: &str,
     weekly_pct: f64,
@@ -1770,54 +1796,117 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            is_dark,
-            text_color,
-            strings.session_window,
-            session_pct,
-            session_text,
-            None,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_fable,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-            bg,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            is_dark,
-            text_color,
-            strings.weekly_window,
-            weekly_pct,
-            weekly_text,
-            Some((fable_weekly_pct, fable_weekly_text)),
-            codex_weekly_pct,
-            codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
-            show_claude_code,
-            show_fable,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-            bg,
-        );
+        let visible_providers =
+            show_claude_code as i32 + show_codex as i32 + show_antigravity as i32;
+        let use_model_text_colors = visible_providers > 1 || (show_claude_code && show_fable);
+        let claude_value_color = if use_model_text_colors {
+            claude_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+        let codex_value_color = if use_model_text_colors {
+            codex_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+        let antigravity_value_color = if use_model_text_colors {
+            antigravity_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+
+        let mut sections: Vec<ProviderSection> = Vec::new();
+        if show_claude_code {
+            let mut bars = vec![
+                ProviderBar {
+                    label: CLAUDE_BAR_LABELS[0],
+                    percent: session_pct,
+                    text: session_text,
+                    accent: *accent,
+                    value_color: claude_value_color,
+                },
+                ProviderBar {
+                    label: CLAUDE_BAR_LABELS[1],
+                    percent: weekly_pct,
+                    text: weekly_text,
+                    accent: *accent,
+                    value_color: claude_value_color,
+                },
+            ];
+            if show_fable && fable_weekly_text != "--" {
+                let fable_accent = fable_accent_color(is_dark);
+                bars.push(ProviderBar {
+                    label: CLAUDE_BAR_LABELS[2],
+                    percent: fable_weekly_pct,
+                    text: fable_weekly_text,
+                    accent: fable_accent,
+                    value_color: fable_accent,
+                });
+            }
+            sections.push(ProviderSection {
+                mask: CLAUDE_LOGO_MASK,
+                tint: *accent,
+                bars,
+            });
+        }
+        if show_codex {
+            let mut bars = Vec::new();
+            // Plans without a session cap report "--" there; drop the bar.
+            if codex_session_text != "--" {
+                bars.push(ProviderBar {
+                    label: CLAUDE_BAR_LABELS[0],
+                    percent: codex_session_pct,
+                    text: codex_session_text,
+                    accent: *codex_accent,
+                    value_color: codex_value_color,
+                });
+            }
+            bars.push(ProviderBar {
+                label: CLAUDE_BAR_LABELS[1],
+                percent: codex_weekly_pct,
+                text: codex_weekly_text,
+                accent: *codex_accent,
+                value_color: codex_value_color,
+            });
+            sections.push(ProviderSection {
+                mask: CODEX_LOGO_MASK,
+                tint: *codex_accent,
+                bars,
+            });
+        }
+        if show_antigravity {
+            let mut bars = vec![ProviderBar {
+                label: CLAUDE_BAR_LABELS[0],
+                percent: antigravity_session_pct,
+                text: antigravity_session_text,
+                accent: *antigravity_accent,
+                value_color: antigravity_value_color,
+            }];
+            if antigravity_weekly_text != "--" {
+                bars.push(ProviderBar {
+                    label: CLAUDE_BAR_LABELS[1],
+                    percent: antigravity_weekly_pct,
+                    text: antigravity_weekly_text,
+                    accent: *antigravity_accent,
+                    value_color: antigravity_value_color,
+                });
+            }
+            sections.push(ProviderSection {
+                mask: ANTIGRAVITY_LOGO_MASK,
+                tint: *antigravity_accent,
+                bars,
+            });
+        }
+
+        let mut section_iter = sections.iter();
+        if let Some(first) = section_iter.next() {
+            draw_provider_section(hdc, content_x, row1_y, first, track, bg, text_color);
+        }
+        let mut row2_x = content_x;
+        for section in section_iter {
+            row2_x = draw_provider_section(hdc, row2_x, row2_y, section, track, bg, text_color)
+                + sc(PROVIDER_GAP);
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -3167,174 +3256,70 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
-fn draw_row(
+struct ProviderBar<'a> {
+    label: &'a str,
+    percent: f64,
+    text: &'a str,
+    accent: Color,
+    value_color: Color,
+}
+
+struct ProviderSection<'a> {
+    mask: &'static [u8],
+    tint: Color,
+    bars: Vec<ProviderBar<'a>>,
+}
+
+/// Draw one provider: its logo up front, then each bar prefixed with a text
+/// label (5h / Wk / Fable). Returns the x just past the section's last bar.
+fn draw_provider_section(
     hdc: HDC,
     x: i32,
     y: i32,
-    is_dark: bool,
-    text_color: &Color,
-    label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    fable: Option<(f64, &str)>,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_fable: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
+    section: &ProviderSection,
     track: &Color,
     bg: &Color,
-) {
+    label_color: &Color,
+) -> i32 {
     let seg_h = sc(SEGMENT_H);
-    let active_models =
-        active_model_count(show_claude_code, show_fable, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-
+    let mut cur = x;
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        let logo_advance = sc(LOGO_SIZE) + sc(LOGO_RIGHT_MARGIN);
-        if show_claude_code {
-            draw_logo(
+        draw_logo(hdc, cur, y, sc(LOGO_SIZE), section.mask, &section.tint, bg);
+        cur += sc(LOGO_SIZE) + sc(LOGO_RIGHT_MARGIN);
+        for (i, bar) in section.bars.iter().enumerate() {
+            if i > 0 {
+                cur += sc(MODEL_RIGHT_MARGIN);
+            }
+            let _ = SetTextColor(hdc, COLORREF(label_color.to_colorref()));
+            let mut label_wide: Vec<u16> = bar.label.encode_utf16().collect();
+            let mut label_rect = RECT {
+                left: cur,
+                top: y,
+                right: cur + sc(bar_label_width(bar.label)),
+                bottom: y + seg_h,
+            };
+            let _ = DrawTextW(
                 hdc,
-                model_x,
-                y,
-                sc(LOGO_SIZE),
-                CLAUDE_LOGO_MASK,
-                claude_accent,
-                bg,
+                &mut label_wide,
+                &mut label_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
+            cur += sc(bar_label_width(bar.label));
             draw_usage_bar(
                 hdc,
-                model_x + logo_advance,
+                cur,
                 y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
+                SEGMENTS_PER_BAR,
+                bar.percent,
+                bar.text,
+                &bar.accent,
                 track,
-                &claude_value_color,
+                &bar.value_color,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_claude_code && show_fable {
-            let fable_accent = fable_accent_color(is_dark);
-            draw_logo(
-                hdc,
-                model_x,
-                y,
-                sc(LOGO_SIZE),
-                CLAUDE_LOGO_MASK,
-                &fable_accent,
-                bg,
-            );
-            // Fable only has a model-scoped weekly cap; its 5-hour usage is
-            // part of the shared session window, so the session row shows "--".
-            let (fable_percent, fable_text) = fable.unwrap_or((0.0, "--"));
-            draw_usage_bar(
-                hdc,
-                model_x + logo_advance,
-                y,
-                segment_count,
-                fable_percent,
-                fable_text,
-                &fable_accent,
-                track,
-                &fable_accent,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_logo(
-                hdc,
-                model_x,
-                y,
-                sc(LOGO_SIZE),
-                CODEX_LOGO_MASK,
-                codex_accent,
-                bg,
-            );
-            draw_usage_bar(
-                hdc,
-                model_x + logo_advance,
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_logo(
-                hdc,
-                model_x,
-                y,
-                sc(LOGO_SIZE),
-                ANTIGRAVITY_LOGO_MASK,
-                antigravity_accent,
-                bg,
-            );
-            draw_usage_bar(
-                hdc,
-                model_x + logo_advance,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-            );
+            cur += bar_track_width() + sc(BAR_RIGHT_MARGIN) + sc(TEXT_WIDTH);
         }
     }
-}
-
-fn model_usage_width(segment_count: i32) -> i32 {
-    sc(LOGO_SIZE)
-        + sc(LOGO_RIGHT_MARGIN)
-        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
-        - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
+    cur
 }
 
 /// Draw a provider logo by downscaling a 64x64 alpha mask with a box filter

@@ -28,6 +28,7 @@ pub const WM_APP_TRAY: u32 = WM_APP + 3;
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
+    pub is_primary: bool,
 }
 
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
@@ -39,7 +40,11 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow { hwnd, rect });
+                    taskbars.push(TaskbarWindow {
+                        hwnd,
+                        rect,
+                        is_primary: class_name == "Shell_TrayWnd",
+                    });
                 }
             }
         }
@@ -50,8 +55,12 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut taskbars as *mut _ as isize));
     }
+    // The primary taskbar (Shell_TrayWnd) must stay at index 0 regardless of
+    // monitor geometry, so taskbar_index=0 keeps meaning "the main taskbar"
+    // even when a secondary display sits above/left of the primary one.
     taskbars.sort_by_key(|taskbar| {
         (
+            !taskbar.is_primary,
             taskbar.rect.top,
             taskbar.rect.left,
             taskbar.rect.bottom,
