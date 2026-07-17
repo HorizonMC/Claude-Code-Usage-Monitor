@@ -89,6 +89,8 @@ struct CodexRateLimitDetails {
 #[derive(Deserialize)]
 struct CodexRateLimitWindow {
     used_percent: f64,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
     reset_at: i64,
 }
 
@@ -857,16 +859,30 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     codex_usage_from_response(response).ok_or(PollError::RequestFailed)
 }
 
+// Some plans (e.g. prolite) expose only a weekly window, delivered as
+// primary_window; classify by window length rather than by position.
+const CODEX_WEEKLY_THRESHOLD_SECS: i64 = 2 * 86_400;
+
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let details = *response.rate_limit.flatten()?;
     let mut data = UsageData::default();
 
-    if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
-    }
-
-    if let Some(window) = details.secondary_window.flatten() {
-        data.weekly = codex_section_from_window(&window);
+    let windows = [
+        (details.primary_window.flatten(), false),
+        (details.secondary_window.flatten(), true),
+    ];
+    for (window, legacy_is_weekly) in windows {
+        let Some(window) = window else { continue };
+        let is_weekly = match window.limit_window_seconds {
+            Some(secs) => secs >= CODEX_WEEKLY_THRESHOLD_SECS,
+            None => legacy_is_weekly,
+        };
+        let section = codex_section_from_window(&window);
+        if is_weekly {
+            data.weekly = section;
+        } else {
+            data.session = section;
+        }
     }
 
     Some(data)
@@ -1635,8 +1651,57 @@ mod tests {
                 percentage,
                 resets_at: None,
             },
-            weekly: UsageSection::default(),
+            ..UsageData::default()
         }
+    }
+
+    fn codex_response(
+        primary: Option<CodexRateLimitWindow>,
+        secondary: Option<CodexRateLimitWindow>,
+    ) -> CodexUsageResponse {
+        CodexUsageResponse {
+            rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+                primary_window: primary.map(|w| Some(Box::new(w))),
+                secondary_window: secondary.map(|w| Some(Box::new(w))),
+            }))),
+        }
+    }
+
+    #[test]
+    fn codex_weekly_only_primary_window_maps_to_weekly_row() {
+        let data = codex_usage_from_response(codex_response(
+            Some(CodexRateLimitWindow {
+                used_percent: 2.0,
+                limit_window_seconds: Some(604_800),
+                reset_at: 1_784_788_159,
+            }),
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(data.weekly.percentage, 2.0);
+        assert_eq!(data.session.percentage, 0.0);
+        assert!(data.session.resets_at.is_none());
+    }
+
+    #[test]
+    fn codex_windows_without_length_keep_legacy_positions() {
+        let data = codex_usage_from_response(codex_response(
+            Some(CodexRateLimitWindow {
+                used_percent: 40.0,
+                limit_window_seconds: None,
+                reset_at: 1_784_788_159,
+            }),
+            Some(CodexRateLimitWindow {
+                used_percent: 7.0,
+                limit_window_seconds: None,
+                reset_at: 1_784_861_050,
+            }),
+        ))
+        .unwrap();
+
+        assert_eq!(data.session.percentage, 40.0);
+        assert_eq!(data.weekly.percentage, 7.0);
     }
 
     #[test]

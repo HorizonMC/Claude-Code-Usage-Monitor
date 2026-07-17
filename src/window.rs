@@ -673,7 +673,12 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
+        state.codex_session_text =
+            if codex.session.resets_at.is_none() && codex.session.percentage == 0.0 {
+                "--".to_string()
+            } else {
+                poller::format_line(&codex.session, strings)
+            };
         state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
