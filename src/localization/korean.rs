@@ -14,6 +14,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    kimi_model: "Kimi",
     settings: "설정",
     start_with_windows: "Windows 시작 시 자동 실행",
     reset_position: "위치 초기화",
@@ -44,7 +45,10 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "터미널에서 'codex'를 실행하고 로그인 안내를 따르세요. 그런 다음 이 앱을 새로 고치거나 다시 시작하세요.",
     antigravity_token_expired_title: "Antigravity 인증 오류",
     antigravity_token_expired_body: "Antigravity를 열고 다시 로그인하세요. 그런 다음 이 앱을 새로 고치거나 다시 시작하세요.",
+    kimi_token_expired_title: "Kimi 인증 오류",
+    kimi_token_expired_body: "터미널에서 'kimi login'을 실행한 다음 이 앱을 새로 고치거나 다시 시작하세요.",
     codex_window_title: "Codex 사용량 모니터",
     antigravity_window_title: "Antigravity 사용량 모니터",
+    kimi_window_title: "Kimi 사용량 모니터",
     second_suffix: "초",
 };

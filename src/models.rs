@@ -19,4 +19,5 @@ pub struct AppUsageData {
     pub claude_code: Option<UsageData>,
     pub codex: Option<UsageData>,
     pub antigravity: Option<UsageData>,
+    pub kimi: Option<UsageData>,
 }

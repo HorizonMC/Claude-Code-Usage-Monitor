@@ -14,6 +14,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    kimi_model: "Kimi",
     settings: "Settings",
     start_with_windows: "Start with Windows",
     reset_position: "Reset Position",
@@ -44,7 +45,10 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "Run 'codex' in a terminal and follow the sign-in prompts. After that, refresh or restart this app.",
     antigravity_token_expired_title: "Antigravity Auth Error",
     antigravity_token_expired_body: "Open Antigravity and sign in again. After that, refresh or restart this app.",
+    kimi_token_expired_title: "Kimi Auth Error",
+    kimi_token_expired_body: "Run 'kimi login' in a terminal, then refresh or restart this app.",
     codex_window_title: "Codex Usage Monitor",
     antigravity_window_title: "Antigravity Usage Monitor",
+    kimi_window_title: "Kimi Usage Monitor",
     second_suffix: "s",
 };

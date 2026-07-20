@@ -16,6 +16,7 @@ use crate::models::{AppUsageData, UsageData, UsageSection};
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
@@ -92,6 +93,37 @@ struct CodexRateLimitWindow {
     #[serde(default)]
     limit_window_seconds: Option<i64>,
     reset_at: i64,
+}
+
+#[derive(Deserialize)]
+struct KimiAuthFile {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+struct KimiUsageResponse {
+    usage: Option<KimiUsageBucket>,
+    #[serde(default)]
+    limits: Vec<KimiLimitEntry>,
+}
+
+#[derive(Deserialize)]
+struct KimiUsageBucket {
+    limit: String,
+    used: String,
+    #[serde(default)]
+    reset_time: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KimiLimitEntry {
+    window: Option<KimiWindow>,
+    detail: Option<KimiUsageBucket>,
+}
+
+#[derive(Deserialize)]
+struct KimiWindow {
+    duration: u64,
 }
 
 #[derive(Deserialize)]
@@ -186,14 +218,17 @@ pub fn poll(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_kimi: bool,
 ) -> Result<AppUsageData, PollError> {
     poll_with(
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_kimi,
         poll_claude_code,
         poll_codex,
         poll_antigravity,
+        poll_kimi,
     )
 }
 
@@ -201,13 +236,18 @@ fn poll_with(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_kimi: bool,
     mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
     mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
     mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
+    mut poll_kimi: impl FnMut() -> Result<UsageData, PollError>,
 ) -> Result<AppUsageData, PollError> {
     let mut data = AppUsageData::default();
     let mut first_error = None;
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
+    let active_provider_count = show_claude_code as u8
+        + show_codex as u8
+        + show_antigravity as u8
+        + show_kimi as u8;
 
     if show_claude_code {
         match poll_claude_code() {
@@ -245,7 +285,23 @@ fn poll_with(
         }
     }
 
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
+    if show_kimi {
+        match poll_kimi() {
+            Ok(kimi) => data.kimi = Some(kimi),
+            Err(error) => {
+                if active_provider_count > 1 {
+                    diagnose::log(format!("Kimi usage poll failed: {error:?}"));
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    if data.claude_code.is_none()
+        && data.codex.is_none()
+        && data.antigravity.is_none()
+        && data.kimi.is_none()
+    {
         Err(first_error.unwrap_or(PollError::RequestFailed))
     } else {
         Ok(data)
@@ -296,6 +352,18 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     };
 
     fetch_antigravity_usage(&creds.access_token)
+}
+
+fn poll_kimi() -> Result<UsageData, PollError> {
+    let creds = match read_kimi_credentials() {
+        Some(creds) => creds,
+        None => {
+            diagnose::log("Kimi usage poll failed: no Kimi credentials found");
+            return Err(PollError::NoCredentials);
+        }
+    };
+
+    fetch_kimi_usage(&creds.access_token)
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -895,6 +963,88 @@ fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     }
 }
 
+fn fetch_kimi_usage(token: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent()?;
+
+    let resp = match agent
+        .get(KIMI_USAGE_URL)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Kimi usage endpoint returned auth error status {code}; refresh required"
+            ));
+            return Err(PollError::AuthRequired);
+        }
+        Err(error) => {
+            diagnose::log_error("Kimi usage endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let response: KimiUsageResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log_error("unable to parse Kimi usage response", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    kimi_usage_from_response(response).ok_or(PollError::RequestFailed)
+}
+
+fn kimi_usage_from_response(response: KimiUsageResponse) -> Option<UsageData> {
+    let mut data = UsageData::default();
+
+    if let Some(ref bucket) = response.usage {
+        data.weekly = kimi_section_from_bucket(bucket);
+    }
+
+    // Pick the shortest rolling window as the session (5h) equivalent.
+    let mut best_window: Option<(u64, UsageSection)> = None;
+    for entry in &response.limits {
+        let detail = entry.detail.as_ref()?;
+        let duration = entry
+            .window
+            .as_ref()
+            .map(|w| w.duration)
+            .unwrap_or(u64::MAX);
+        let section = kimi_section_from_bucket(detail);
+        if best_window
+            .as_ref()
+            .map(|(best_duration, _)| duration < *best_duration)
+            .unwrap_or(true)
+        {
+            best_window = Some((duration, section));
+        }
+    }
+    if let Some((_, section)) = best_window {
+        data.session = section;
+    }
+
+    // If we got at least one valid section, return the data.
+    if data.weekly.percentage > 0.0 || data.session.percentage > 0.0 {
+        Some(data)
+    } else if response.usage.is_some() || !response.limits.is_empty() {
+        // Accept zero-usage responses too, as long as the API returned something.
+        Some(data)
+    } else {
+        None
+    }
+}
+
+fn kimi_section_from_bucket(bucket: &KimiUsageBucket) -> UsageSection {
+    let limit: f64 = bucket.limit.parse().unwrap_or(0.0);
+    let limit = limit.max(1.0);
+    let used: f64 = bucket.used.parse().unwrap_or(0.0);
+    UsageSection {
+        percentage: (used / limit * 100.0).clamp(0.0, 100.0),
+        resets_at: parse_iso8601(bucket.reset_time.as_deref()),
+    }
+}
+
 fn antigravity_credential_watch_signature() -> String {
     let Some(content) = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET) else {
         return format!("{ANTIGRAVITY_CREDENTIAL_TARGET}|missing");
@@ -1303,6 +1453,31 @@ fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     }
 }
 
+fn kimi_credentials_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".kimi-code").join("credentials").join("kimi-code.json"))
+}
+
+fn read_kimi_credentials() -> Option<KimiAuthFile> {
+    let path = kimi_credentials_path()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            diagnose::log_error(
+                &format!("unable to read Kimi credentials at {}", path.display()),
+                error,
+            );
+            return None;
+        }
+    };
+
+    let auth: KimiAuthFile = serde_json::from_str(&content).ok()?;
+    if auth.access_token.is_empty() {
+        None
+    } else {
+        Some(auth)
+    }
+}
+
 fn read_windows_generic_credential(target: &str) -> Option<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
@@ -1639,6 +1814,7 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
     data.claude_code.as_ref().is_some_and(is_past_reset)
         || data.codex.as_ref().is_some_and(is_past_reset)
         || data.antigravity.as_ref().is_some_and(is_past_reset)
+        || data.kimi.as_ref().is_some_and(is_past_reset)
 }
 
 #[cfg(test)]
