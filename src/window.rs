@@ -2127,6 +2127,12 @@ fn do_poll(send_hwnd: SendHwnd) {
                     }
                 }
 
+                diagnose::log(format!(
+                    "poll ok: claude={}%, codex={}%, kimi={}%",
+                    data.claude_code.as_ref().map(|d| d.session.percentage).unwrap_or(-1.0),
+                    data.codex.as_ref().map(|d| d.session.percentage).unwrap_or(-1.0),
+                    data.kimi.as_ref().map(|d| d.session.percentage).unwrap_or(-1.0),
+                ));
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
