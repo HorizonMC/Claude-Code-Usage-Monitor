@@ -110,7 +110,8 @@ struct KimiUsageResponse {
 #[derive(Deserialize)]
 struct KimiUsageBucket {
     limit: String,
-    used: String,
+    #[serde(default)]
+    used: Option<String>,
     #[serde(default)]
     reset_time: Option<String>,
 }
@@ -309,6 +310,7 @@ fn poll_with(
 }
 
 fn poll_claude_code() -> Result<UsageData, PollError> {
+    diagnose::log("poll_claude_code: reading credentials");
     let creds = match read_first_credentials() {
         Some(c) => c,
         None => {
@@ -316,8 +318,10 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
             return Err(PollError::NoCredentials);
         }
     };
+    diagnose::log("poll_claude_code: credentials found, checking expiry");
 
     let creds = refresh_or_fallback(creds)?;
+    diagnose::log("poll_claude_code: fetching usage");
 
     fetch_usage_with_fallback(&creds.access_token)
 }
@@ -363,7 +367,15 @@ fn poll_kimi() -> Result<UsageData, PollError> {
         }
     };
 
-    fetch_kimi_usage(&creds.access_token)
+    match fetch_kimi_usage(&creds.access_token) {
+        Ok(data) => Ok(data),
+        Err(PollError::AuthRequired) => {
+            cli_refresh_kimi_token();
+            let refreshed = read_kimi_credentials().ok_or(PollError::TokenExpired)?;
+            fetch_kimi_usage(&refreshed.access_token)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -524,6 +536,32 @@ fn cli_refresh_codex_token() {
     wait_for_refresh(&mut child);
 }
 
+fn cli_refresh_kimi_token() {
+    let kimi_path = resolve_windows_kimi_path();
+    let is_cmd = kimi_path.to_lowercase().ends_with(".cmd");
+    diagnose::log(format!(
+        "attempting Windows Kimi token refresh via {kimi_path}"
+    ));
+
+    let args: &[&str] = &["-p", "."];
+
+    let mut cmd = if is_cmd {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(&kimi_path).args(args);
+        c
+    } else {
+        let mut c = Command::new(&kimi_path);
+        c.args(args);
+        c
+    };
+    cmd.creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let _ = run_with_timeout(&mut cmd, Duration::from_secs(30));
+}
+
 /// Spawn a command and wait up to `timeout` for it to finish.
 /// Returns None if the process fails to start or exceeds the deadline.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
@@ -634,6 +672,41 @@ fn resolve_windows_codex_path() -> String {
     "codex.cmd".to_string()
 }
 
+fn resolve_windows_kimi_path() -> String {
+    for name in &["kimi.exe", "kimi.cmd", "kimi"] {
+        if Command::new(name)
+            .arg("--version")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return name.to_string();
+        }
+    }
+
+    for name in &["kimi.exe", "kimi.cmd", "kimi"] {
+        if let Ok(output) = Command::new("where.exe")
+            .arg(name)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(first_line) = stdout.lines().next() {
+                    let path = first_line.trim().to_string();
+                    if !path.is_empty() {
+                        return path;
+                    }
+                }
+            }
+        }
+    }
+
+    "kimi.exe".to_string()
+}
+
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
     Ok(ureq::AgentBuilder::new()
@@ -734,6 +807,7 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
+    diagnose::log("fetch_usage_with_fallback: trying usage endpoint");
     // Try the dedicated usage endpoint first
     match try_usage_endpoint(token)? {
         Some(data) => {
@@ -764,27 +838,47 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
 }
 
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
+    diagnose::log("try_usage_endpoint: building agent");
     let agent = build_agent()?;
+    diagnose::log("try_usage_endpoint: agent built");
 
+    diagnose::log("try_usage_endpoint: sending request");
     let resp = match agent
         .get(USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
         .call()
     {
-        Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "usage endpoint returned auth error status {code}; re-login required"
-            ));
-            return Err(PollError::AuthRequired);
+        Ok(resp) => {
+            diagnose::log(format!("try_usage_endpoint: response status {}", resp.status()));
+            resp
         }
-        Err(_) => return Ok(None),
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!("try_usage_endpoint: error status {code}"));
+            if code == 401 || code == 403 {
+                diagnose::log(format!(
+                    "usage endpoint returned auth error status {code}; re-login required"
+                ));
+                return Err(PollError::AuthRequired);
+            }
+            return Ok(None);
+        }
+        Err(error) => {
+            diagnose::log_error("try_usage_endpoint: request failed", error);
+            return Ok(None);
+        }
     };
 
+    diagnose::log("try_usage_endpoint: reading JSON");
     let response: UsageResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(_) => return Ok(None),
+        Ok(response) => {
+            diagnose::log("try_usage_endpoint: JSON parsed");
+            response
+        }
+        Err(error) => {
+            diagnose::log_error("try_usage_endpoint: JSON parse failed", error);
+            return Ok(None);
+        }
     };
     let mut data = UsageData::default();
 
@@ -1038,7 +1132,11 @@ fn kimi_usage_from_response(response: KimiUsageResponse) -> Option<UsageData> {
 fn kimi_section_from_bucket(bucket: &KimiUsageBucket) -> UsageSection {
     let limit: f64 = bucket.limit.parse().unwrap_or(0.0);
     let limit = limit.max(1.0);
-    let used: f64 = bucket.used.parse().unwrap_or(0.0);
+    let used: f64 = bucket
+        .used
+        .as_deref()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
     UsageSection {
         percentage: (used / limit * 100.0).clamp(0.0, 100.0),
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
@@ -1886,9 +1984,11 @@ mod tests {
             true,
             true,
             false,
+            false,
             || Err(PollError::AuthRequired),
             || Ok(usage_with_session_percent(42.0)),
             || unreachable!("antigravity is disabled"),
+            || unreachable!("kimi is disabled"),
         )
         .expect("codex data should keep the poll successful");
 
@@ -1902,9 +2002,11 @@ mod tests {
             true,
             true,
             false,
+            false,
             || Ok(usage_with_session_percent(64.0)),
             || Err(PollError::RequestFailed),
             || unreachable!("antigravity is disabled"),
+            || unreachable!("kimi is disabled"),
         )
         .expect("claude data should keep the poll successful");
 
@@ -1918,9 +2020,11 @@ mod tests {
             true,
             true,
             true,
+            true,
             || Err(PollError::AuthRequired),
             || Err(PollError::RequestFailed),
             || Err(PollError::NoCredentials),
+            || Err(PollError::RequestFailed),
         )
         .expect_err("all-provider failure should return an error");
 
@@ -1933,9 +2037,11 @@ mod tests {
             false,
             true,
             true,
+            false,
             || unreachable!("claude code is disabled"),
             || Ok(usage_with_session_percent(42.0)),
             || Err(PollError::NoCredentials),
+            || unreachable!("kimi is disabled"),
         )
         .expect("codex data should keep the poll successful");
 

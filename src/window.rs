@@ -1306,9 +1306,11 @@ pub fn run() {
     }
     diagnose::log("window::run started");
 
-    // Single-instance guard: silently exit if another instance is running.
-    // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
-    // wait for the previous instance to release the mutex, then take over.
+    // Single-instance guard: exit if another instance is running, but take over
+    // if the previous instance crashed and left the mutex abandoned.
+    const WAIT_OBJECT_0_VALUE: u32 = 0;
+    const WAIT_ABANDONED_VALUE: u32 = 0x00000080;
+    const WAIT_TIMEOUT_VALUE: u32 = 0x00000102;
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
     let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
     let _mutex = unsafe {
@@ -1316,18 +1318,27 @@ pub fn run() {
         match handle {
             Ok(h) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let timeout_ms = if is_relaunch { 10_000 } else { 2_000 };
                     if is_relaunch {
                         diagnose::log("relaunch: waiting for previous instance to exit");
-                        let wait_result = WaitForSingleObject(h, 10_000);
-                        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+                    } else {
+                        diagnose::log("single-instance mutex exists; checking for abandoned/crashed instance");
+                    }
+                    let wait_result = WaitForSingleObject(h, timeout_ms);
+                    match wait_result.0 {
+                        WAIT_OBJECT_0_VALUE | WAIT_ABANDONED_VALUE => {
+                            diagnose::log("taking over single-instance mutex");
+                        }
+                        WAIT_TIMEOUT_VALUE => {
+                            diagnose::log("startup aborted: another instance is already running");
+                            return;
+                        }
+                        _ => {
                             diagnose::log(format!(
-                                "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
+                                "startup aborted: single-instance wait failed ({wait_result:?})"
                             ));
                             return;
                         }
-                    } else {
-                        diagnose::log("startup aborted: another instance is already running");
-                        return;
                     }
                 }
                 h
