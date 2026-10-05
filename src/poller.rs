@@ -4,10 +4,19 @@ use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 
 use crate::diagnose;
 use crate::localization::Strings;
@@ -414,21 +423,32 @@ fn cli_refresh_token(source: &CredentialSource) {
 }
 
 fn cli_refresh_windows_token() {
+    if !cli_refresh_allowed(CliProvider::Claude) {
+        return;
+    }
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
         "attempting Windows Claude token refresh via {claude_path}"
     ));
 
-    let args: &[&str] = &["-p", "."];
+    // A bare `-p .` starts every configured MCP server (each one a node/bun
+    // process holding hundreds of MB of commit) just to trigger a token
+    // refresh. Point the CLI at an empty MCP config so only claude itself runs,
+    // and don't leave a junk session behind.
+    let mcp_config = empty_mcp_config_path();
+    let mut args: Vec<&str> = vec!["-p", ".", "--no-session-persistence"];
+    if let Some(path) = mcp_config.as_deref() {
+        args.extend(["--strict-mcp-config", "--mcp-config", path]);
+    }
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&claude_path).args(args);
+        c.arg("/c").arg(&claude_path).args(&args);
         c
     } else {
         let mut c = Command::new(&claude_path);
-        c.args(args);
+        c.args(&args);
         c
     };
     cmd.env_remove("CLAUDECODE")
@@ -438,32 +458,31 @@ fn cli_refresh_windows_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Claude token refresh", error);
-            return;
-        }
-    };
+    run_tree_with_timeout(&mut cmd, CLI_REFRESH_TIMEOUT, "Windows Claude token refresh");
+}
 
-    // Wait up to 30 seconds — don't block the poll thread forever
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
+/// Path to a JSON file declaring zero MCP servers, written once per run into
+/// the temp dir. Passed as a file (not inline JSON) so it survives cmd.exe
+/// argument quoting.
+fn empty_mcp_config_path() -> Option<String> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join("claude-code-usage-monitor-empty-mcp.json");
+        match std::fs::write(&path, "{\"mcpServers\":{}}\n") {
+            Ok(()) => Some(path.to_string_lossy().into_owned()),
+            Err(error) => {
+                diagnose::log_error("unable to write empty MCP config", error);
+                None
             }
-            Err(_) => break,
         }
-    }
+    })
+    .clone()
 }
 
 fn cli_refresh_wsl_token(distro: &str) {
+    if !cli_refresh_allowed(CliProvider::Claude) {
+        return;
+    }
     diagnose::log(format!(
         "attempting WSL Claude token refresh in distro {distro}"
     ));
@@ -481,18 +500,13 @@ fn cli_refresh_wsl_token(distro: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn WSL Claude token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
+    run_tree_with_timeout(&mut cmd, CLI_REFRESH_TIMEOUT, "WSL Claude token refresh");
 }
 
 fn cli_refresh_codex_token() {
+    if !cli_refresh_allowed(CliProvider::Codex) {
+        return;
+    }
     let codex_path = resolve_windows_codex_path();
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
     let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
@@ -525,18 +539,13 @@ fn cli_refresh_codex_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
+    run_tree_with_timeout(&mut cmd, CLI_REFRESH_TIMEOUT, "Windows Codex token refresh");
 }
 
 fn cli_refresh_kimi_token() {
+    if !cli_refresh_allowed(CliProvider::Kimi) {
+        return;
+    }
     let kimi_path = resolve_windows_kimi_path();
     let is_cmd = kimi_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
@@ -559,7 +568,7 @@ fn cli_refresh_kimi_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let _ = run_with_timeout(&mut cmd, Duration::from_secs(30));
+    run_tree_with_timeout(&mut cmd, CLI_REFRESH_TIMEOUT, "Windows Kimi token refresh");
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
@@ -583,128 +592,286 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
     }
 }
 
-fn wait_for_refresh(child: &mut std::process::Child) {
-    // Wait up to 30 seconds; don't block the poll thread forever.
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
+/// How long a CLI-driven token refresh may run before its whole process tree
+/// is killed. Claude Code on a busy machine can take 20+ seconds just to start.
+const CLI_REFRESH_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Minimum gap between two CLI refresh attempts for the same provider. A refresh
+/// that did not help within this window will not help when retried 5 seconds
+/// later either — retrying only stacks up CLI processes.
+const CLI_REFRESH_MIN_GAP: Duration = Duration::from_secs(120);
+
+/// How long a `<cli> --version` probe may take while resolving a CLI path.
+const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum CliProvider {
+    Claude,
+    Codex,
+    Kimi,
+}
+
+/// Rate-limit CLI refresh attempts per provider. Returns `false` (and logs)
+/// when the previous attempt for this provider was too recent.
+fn cli_refresh_allowed(provider: CliProvider) -> bool {
+    static LAST_ATTEMPT: OnceLock<Mutex<HashMap<CliProvider, Instant>>> = OnceLock::new();
+    let map = LAST_ATTEMPT.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    if let Some(last) = map.get(&provider) {
+        let elapsed = now.duration_since(*last);
+        if elapsed < CLI_REFRESH_MIN_GAP {
+            diagnose::log(format!(
+                "{provider:?} CLI token refresh skipped: last attempt was {}s ago",
+                elapsed.as_secs()
+            ));
+            return false;
         }
     }
+    map.insert(provider, now);
+    true
+}
+
+/// Owned job-object handle; closing it kills every process still inside.
+struct JobHandle(HANDLE);
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn create_kill_on_close_job() -> Option<JobHandle> {
+    unsafe {
+        let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let result = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if result.is_err() {
+            let _ = CloseHandle(job);
+            return None;
+        }
+        Some(JobHandle(job))
+    }
+}
+
+/// Spawn `cmd` inside a kill-on-close job object and wait up to `timeout`.
+///
+/// The CLIs are launched through `cmd.exe /c foo.cmd`, so killing the child we
+/// spawned only kills the shell and leaves `claude.exe` (plus every MCP server
+/// it started) running as an orphan. The job object ties the entire tree to
+/// this call: it dies on timeout, and anything left over dies when the job
+/// handle is dropped.
+fn run_tree_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> Option<std::process::ExitStatus> {
+    let job = create_kill_on_close_job();
+    if job.is_none() {
+        diagnose::log(format!("{label}: job object unavailable, relying on taskkill /T"));
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            diagnose::log_error(&format!("unable to spawn {label}"), error);
+            return None;
+        }
+    };
+    if let Some(job) = job.as_ref() {
+        unsafe {
+            if let Err(error) = AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle())) {
+                diagnose::log(format!("{label}: AssignProcessToJobObject failed: {error}"));
+            }
+        }
+    }
+
+    let pid = child.id();
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                diagnose::log(format!(
+                    "{label}: finished in {}s ({status})",
+                    start.elapsed().as_secs()
+                ));
+                return Some(status);
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                diagnose::log(format!(
+                    "{label}: timed out after {}s, killing process tree pid={pid}",
+                    timeout.as_secs()
+                ));
+                kill_process_tree(job.as_ref(), pid);
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn kill_process_tree(job: Option<&JobHandle>, pid: u32) {
+    if let Some(job) = job {
+        unsafe {
+            let _ = TerminateJobObject(job.0, 1);
+        }
+    }
+    // Fallback for the (tiny) window where cmd.exe spawned its child before
+    // the job assignment landed, or when job assignment failed outright.
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Find the first of `names` that answers `--version`, then fall back to
+/// `where.exe`, then to `fallback`. Each probe is bounded by a timeout and
+/// the answer is cached for the life of the process — every poll used to
+/// re-spawn `claude --version`, `codex --version` and `kimi --version`.
+fn resolve_cli_path(cache: &'static OnceLock<String>, names: &[&str], fallback: &str) -> String {
+    cache
+        .get_or_init(|| {
+            for name in names {
+                let mut probe = Command::new(name);
+                probe
+                    .arg("--version")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if run_tree_with_timeout(&mut probe, CLI_PROBE_TIMEOUT, "CLI version probe")
+                    .is_some()
+                {
+                    return name.to_string();
+                }
+            }
+
+            for name in names {
+                let mut probe = Command::new("where.exe");
+                probe
+                    .arg(name)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null());
+                if let Some(output) = run_with_timeout(&mut probe, CLI_PROBE_TIMEOUT) {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        if let Some(first_line) = stdout.lines().next() {
+                            let path = first_line.trim().to_string();
+                            if !path.is_empty() {
+                                return path;
+                            }
+                        }
+                    }
+                }
+            }
+
+            fallback.to_string()
+        })
+        .clone()
 }
 
 /// Resolve the full path to the `claude` CLI executable.
 fn resolve_windows_claude_path() -> String {
-    for name in &["claude.cmd", "claude"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["claude.cmd", "claude"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "claude.cmd".to_string()
+    static CACHE: OnceLock<String> = OnceLock::new();
+    resolve_cli_path(&CACHE, &["claude.cmd", "claude"], "claude.cmd")
 }
 
 fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "codex.cmd".to_string()
+    static CACHE: OnceLock<String> = OnceLock::new();
+    resolve_cli_path(
+        &CACHE,
+        &["codex.cmd", "codex.ps1", "codex.exe", "codex"],
+        "codex.cmd",
+    )
 }
 
 fn resolve_windows_kimi_path() -> String {
-    for name in &["kimi.exe", "kimi.cmd", "kimi"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
+    static CACHE: OnceLock<String> = OnceLock::new();
+    resolve_cli_path(&CACHE, &["kimi.exe", "kimi.cmd", "kimi"], "kimi.exe")
+}
 
-    for name in &["kimi.exe", "kimi.cmd", "kimi"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
+/// Email of the account that owns this instance's Claude OAuth token, from the
+/// profile API (.claude.json's oauthAccount can describe a different login than
+/// the token in use). Never blocks: returns the last known email and refreshes
+/// in the background hourly, when the token changes, or 5 min after a failure.
+pub fn claude_account_email_cached() -> Option<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    struct Profile {
+        token: String,
+        checked: Instant,
+        ok: bool,
+        email: Option<String>,
+    }
+    static PROFILE: Mutex<Option<Profile>> = Mutex::new(None);
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+    let token = read_windows_credentials()?.access_token;
+    let guard = PROFILE.lock().ok()?;
+    let email = guard.as_ref().and_then(|p| p.email.clone());
+    let stale = match guard.as_ref() {
+        None => true,
+        Some(p) => {
+            let max_age = Duration::from_secs(if p.ok { 3600 } else { 300 });
+            p.token != token || p.checked.elapsed() >= max_age
+        }
+    };
+    drop(guard);
+
+    if stale && !IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(move || {
+            let fetched = fetch_claude_profile_email(&token);
+            if let Ok(mut guard) = PROFILE.lock() {
+                let previous = guard.as_ref().and_then(|p| p.email.clone());
+                *guard = Some(Profile {
+                    ok: fetched.is_some(),
+                    email: fetched.or(previous),
+                    token,
+                    checked: Instant::now(),
+                });
             }
-        }
+            IN_FLIGHT.store(false, Ordering::SeqCst);
+        });
     }
+    email
+}
 
-    "kimi.exe".to_string()
+fn fetch_claude_profile_email(token: &str) -> Option<String> {
+    let response = build_agent()
+        .ok()?
+        .get("https://api.anthropic.com/api/oauth/profile")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .call();
+    let body: serde_json::Value = match response {
+        Ok(resp) => resp.into_json().ok()?,
+        Err(error) => {
+            if diagnose::is_enabled() {
+                diagnose::log(format!("claude profile lookup failed: {error}"));
+            }
+            return None;
+        }
+    };
+    body["account"]["email_address"]
+        .as_str()
+        .or_else(|| body["account"]["email"].as_str())
+        .map(str::to_string)
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
@@ -749,6 +916,12 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
 }
 
 fn windows_credential_source() -> Option<CredentialSource> {
+    // `--claude-config-dir` (exported as CLAUDE_CONFIG_DIR) pins this instance to one account.
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(CredentialSource::Windows(
+            PathBuf::from(dir).join(".credentials.json"),
+        ));
+    }
     let home = dirs::home_dir()?;
     Some(CredentialSource::Windows(
         home.join(".claude").join(".credentials.json"),
@@ -1690,6 +1863,10 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
 }
 
 fn list_wsl_distros() -> Vec<String> {
+    // Pinned to one Windows config dir: never fall back to another account in WSL.
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+        return Vec::new();
+    }
     let output = match run_with_timeout(
         Command::new("wsl.exe")
             .args(["-l", "-q"])
@@ -1835,14 +2012,14 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text
+/// Format a usage section as "X%·Yh" style text (compact, no spaces)
 pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", section.percentage);
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
     } else {
-        format!("{pct} \u{00b7} {cd}")
+        format!("{pct}\u{00b7}{cd}")
     }
 }
 

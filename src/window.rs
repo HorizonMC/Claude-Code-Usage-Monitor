@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,10 +20,12 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_SYSTEM, TIMER_UPDATE_CHECK,
+    WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::sysinfo;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -78,6 +80,8 @@ struct AppState {
     show_codex: bool,
     show_antigravity: bool,
     show_kimi: bool,
+    /// Show CPU / RAM / commit / disk / network next to the usage bars.
+    show_system: bool,
 
     data: Option<AppUsageData>,
 
@@ -88,10 +92,20 @@ struct AppState {
     auth_watch_mode: poller::CredentialWatchMode,
     auth_watch_snapshot: poller::CredentialWatchSnapshot,
     last_poll_ok: bool,
+    /// Number of 5-second "past reset" polls fired since the data was last
+    /// fresh. Capped so a provider that keeps reporting a stale reset time
+    /// cannot keep the widget polling every 5 seconds forever.
+    reset_poll_attempts: u32,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
+    /// Taskbar the widget is embedded in right now.
     taskbar_index: usize,
+    /// Taskbar the user chose (persisted). Differs from `taskbar_index` only
+    /// while that taskbar is temporarily gone — monitor asleep, explorer
+    /// still rebuilding — in which case the widget parks on a fallback and
+    /// moves back as soon as the wanted taskbar exists again.
+    wanted_taskbar_index: usize,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -111,6 +125,26 @@ enum UpdateStatus {
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
+
+/// Interval of the fast poll used right after a usage window's reset time.
+const RESET_POLL_MS: u32 = 5_000;
+/// Give up fast polling after this many attempts (1 minute at 5 s) and fall
+/// back to the regular interval until the data is fresh again.
+const MAX_RESET_POLL_ATTEMPTS: u32 = 12;
+
+/// Set while a poll thread is running. Timers fire independently of how long
+/// a poll takes (a CLI token refresh alone can block for 45 s), so without
+/// this guard every tick stacks another poll — and another CLI process — on
+/// top of the one still running.
+static POLL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct PollInFlightGuard;
+
+impl Drop for PollInFlightGuard {
+    fn drop(&mut self) {
+        POLL_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
 
 const POLL_1_MIN: u32 = 60_000;
 const POLL_5_MIN: u32 = 300_000;
@@ -140,9 +174,16 @@ const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_MODEL_KIMI: u16 = 63;
+const IDM_SHOW_SYSTEM: u16 = 70;
+
+/// Refresh interval for the local system stats block.
+const SYSTEM_POLL_MS: u32 = 2_000;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+/// Posted by the taskbar watchdog when the user's preferred taskbar exists
+/// again after the widget had to park on a fallback one.
+const WM_APP_REATTACH: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -243,9 +284,12 @@ fn relaunch_self() {
 fn spawn_taskbar_watchdog() {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
+        let (stored, wanted, hwnd) = {
             let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
+            match state.as_ref() {
+                Some(s) => (s.taskbar_hwnd, s.wanted_taskbar_index, s.hwnd),
+                None => (None, 0, SendHwnd(0)),
+            }
         };
         // Only relevant once we have embedded into a taskbar at least once.
         let Some(old) = stored else {
@@ -259,6 +303,19 @@ fn spawn_taskbar_watchdog() {
                 old.0, new.0
             ));
             relaunch_self();
+            continue;
+        }
+        // Parked on a fallback taskbar (the wanted one was missing at attach
+        // time)? Move back now that it exists. Must happen on the UI thread.
+        if let Some(target) = taskbars.get(wanted) {
+            if target.hwnd != old {
+                diagnose::log(format!(
+                    "watchdog: preferred taskbar index={wanted} is back -> re-attaching"
+                ));
+                unsafe {
+                    let _ = PostMessageW(hwnd.to_hwnd(), WM_APP_REATTACH, WPARAM(0), LPARAM(0));
+                }
+            }
         }
     });
 }
@@ -293,6 +350,25 @@ unsafe impl Send for AppState {}
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
 
+/// Optional instance profile from `--profile <name>`. A profile gets its own
+/// settings file, single-instance mutex and startup entry, so two widgets can
+/// run side by side — e.g. the usage bars on the laptop taskbar and a
+/// system-stats-only instance on an external monitor's taskbar.
+static PROFILE: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn set_profile(name: Option<String>) {
+    let _ = PROFILE.set(name);
+}
+
+fn profile() -> Option<&'static str> {
+    PROFILE.get().and_then(|p| p.as_deref())
+}
+
+/// `-<profile>` for a named profile, empty for the default instance.
+fn profile_suffix() -> String {
+    profile().map(|p| format!("-{p}")).unwrap_or_default()
+}
+
 /// Lock STATE safely, recovering from poisoned mutex
 fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -302,7 +378,7 @@ fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata)
         .join("ClaudeCodeUsageMonitor")
-        .join("settings.json")
+        .join(format!("settings{}.json", profile_suffix()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -329,6 +405,8 @@ struct SettingsFile {
     show_antigravity: bool,
     #[serde(default = "default_show_kimi")]
     show_kimi: bool,
+    #[serde(default = "default_show_system")]
+    show_system: bool,
 }
 
 impl Default for SettingsFile {
@@ -345,12 +423,17 @@ impl Default for SettingsFile {
             show_codex: false,
             show_antigravity: false,
             show_kimi: false,
+            show_system: true,
         }
     }
 }
 
 fn default_show_kimi() -> bool {
     false
+}
+
+fn default_show_system() -> bool {
+    true
 }
 
 fn default_poll_interval() -> u32 {
@@ -380,6 +463,19 @@ fn default_show_antigravity() -> bool {
 fn load_settings() -> SettingsFile {
     let content = match std::fs::read_to_string(settings_path()) {
         Ok(c) => c,
+        // A named profile that has never been saved starts as a system-stats
+        // only widget; the default instance keeps the usual Claude bars.
+        Err(_) if profile().is_some() => {
+            return SettingsFile {
+                show_claude_code: false,
+                show_fable: false,
+                show_codex: false,
+                show_antigravity: false,
+                show_kimi: false,
+                show_system: true,
+                ..SettingsFile::default()
+            }
+        }
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
@@ -387,6 +483,7 @@ fn load_settings() -> SettingsFile {
         && !settings.show_codex
         && !settings.show_antigravity
         && !settings.show_kimi
+        && !settings.show_system
     {
         settings.show_claude_code = true;
     }
@@ -408,7 +505,7 @@ fn save_state_settings() {
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
-            taskbar_index: s.taskbar_index,
+            taskbar_index: s.wanted_taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -420,6 +517,7 @@ fn save_state_settings() {
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
             show_kimi: s.show_kimi,
+            show_system: s.show_system,
         });
     }
 }
@@ -1002,11 +1100,29 @@ fn begin_winget_update(hwnd: HWND) {
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
 
+/// Run-key value name; a profile instance gets its own entry.
+fn startup_registry_key() -> String {
+    format!("{STARTUP_REGISTRY_KEY}{}", profile_suffix())
+}
+
+/// The command stored in the Run key: the bare exe path for the default
+/// instance (unchanged from upstream), `"exe" --profile <name>` otherwise.
+fn startup_command(exe: &str) -> String {
+    let cmd = match profile() {
+        Some(name) => format!("\"{exe}\" --profile {name}"),
+        None => exe.to_string(),
+    };
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if profile().is_some() => format!("{cmd} --claude-config-dir \"{dir}\""),
+        _ => cmd,
+    }
+}
+
 /// Returns true only if the startup registry value points to this executable.
 fn is_startup_enabled() -> bool {
     unsafe {
         let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
-        let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
+        let key_name = native_interop::wide_str(&startup_registry_key());
 
         let mut hkey = HKEY::default();
         let result = RegOpenKeyExW(
@@ -1064,9 +1180,10 @@ fn is_startup_enabled() -> bool {
             return false;
         }
         let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
+        let expected = startup_command(&current_exe);
 
         // Case-insensitive comparison (Windows paths are case-insensitive)
-        reg_value.eq_ignore_ascii_case(&current_exe)
+        reg_value.eq_ignore_ascii_case(&expected)
     }
 }
 
@@ -1086,22 +1203,24 @@ fn set_startup_enabled(enable: bool) {
             return;
         }
 
-        let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
+        let key_name = native_interop::wide_str(&startup_registry_key());
 
         if enable {
             let mut exe_buf = [0u16; 260];
             let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
             if len > 0 {
-                // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
+                let command = startup_command(&String::from_utf16_lossy(&exe_buf[..len]));
+                // wide_str appends the null terminator.
+                let command_wide = native_interop::wide_str(&command);
+                let byte_len = command_wide.len() * 2;
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
-                        byte_len as usize,
+                        command_wide.as_ptr() as *const u8,
+                        byte_len,
                     )),
                 );
             }
@@ -1114,20 +1233,20 @@ fn set_startup_enabled(enable: bool) {
 }
 
 // Dimensions matching the C# version
-const SEGMENT_W: i32 = 10;
+const SEGMENT_W: i32 = 6;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
+const DIVIDER_RIGHT_MARGIN: i32 = 6;
 const LOGO_SIZE: i32 = 13;
 const LOGO_RIGHT_MARGIN: i32 = 4;
 
 const SEGMENTS_PER_BAR: i32 = 4;
-const PROVIDER_GAP: i32 = 14;
+const PROVIDER_GAP: i32 = 10;
 const BAR_LABEL_SHORT_W: i32 = 20;
-const BAR_LABEL_LONG_W: i32 = 36;
+const BAR_LABEL_LONG_W: i32 = 33;
 const CLAUDE_BAR_LABELS: [&str; 3] = ["5h", "Wk", "Fable"];
 
 const LOGO_MASK_SIZE: usize = 64;
@@ -1136,10 +1255,62 @@ static CODEX_LOGO_MASK: &[u8] = include_bytes!("logo_masks/openai.alpha");
 static ANTIGRAVITY_LOGO_MASK: &[u8] = include_bytes!("logo_masks/antigravity.alpha");
 static KIMI_LOGO_MASK: &[u8] = include_bytes!("logo_masks/kimi.alpha");
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 48; // "100%·6d" (Segoe UI 12px)
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
+
+// System stats block (to the right of the provider bars). Two text rows,
+// mirroring the Rainmeter illustro layout the user replaced:
+//   row 1: CPU xx%   RAM xx%   SWAP xx%   <ip>
+//   row 2: C: used/total GB   D: ...   ↑ up   ↓ down
+// Every slot has a fixed width so values don't jitter as digits change.
+const SYSTEM_GAP: i32 = 12;
+const SYSTEM_DIVIDER_W: i32 = 1;
+const SYSTEM_ITEM_GAP: i32 = 6;
+const SYS_CPU_W: i32 = 56; // "CPU 100%"
+const SYS_RAM_W: i32 = 56; // "RAM 100%"
+const SYS_SWAP_W: i32 = 62; // "SWAP 100%"
+const SYS_NET_W: i32 = 52; // "↑999.9K/s"
+const SYS_DISK_W: i32 = 62; // "C: 237/268"
+const SYS_IP_W: i32 = 76; // "27.130.158.45" (15-char IPs clip slightly)
+/// Values at or above this are drawn in the warning colour.
+const SYS_WARN_PERCENT: f64 = 90.0;
+
+fn system_disk_count() -> usize {
+    sysinfo::latest()
+        .map(|stats| stats.disks.len())
+        .unwrap_or(2)
+        .clamp(1, sysinfo::MAX_DISKS)
+}
+
+fn system_row1_width() -> i32 {
+    sc(SYS_CPU_W) + sc(SYS_RAM_W) + sc(SYS_SWAP_W) + sc(SYS_IP_W) + sc(SYSTEM_ITEM_GAP) * 3
+}
+
+fn system_row2_width(disk_count: usize) -> i32 {
+    let disks = disk_count.max(1) as i32;
+    sc(SYS_DISK_W) * disks + sc(SYS_NET_W) * 2 + sc(SYSTEM_ITEM_GAP) * (disks + 1)
+}
+
+/// Width of the whole system block, including the gap and divider that
+/// separate it from the provider bars when there are any.
+fn system_section_width(disk_count: usize, with_divider: bool) -> i32 {
+    let divider = if with_divider {
+        sc(SYSTEM_GAP) + sc(SYSTEM_DIVIDER_W) + sc(SYSTEM_GAP)
+    } else {
+        0
+    };
+    divider + system_row1_width().max(system_row2_width(disk_count))
+}
+
+fn system_warn_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#F07A6A")
+    } else {
+        Color::from_hex("#C8402E")
+    }
+}
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
@@ -1192,6 +1363,25 @@ fn total_widget_width_for_flags(
     show_codex: bool,
     show_antigravity: bool,
     show_kimi: bool,
+    show_system: bool,
+) -> i32 {
+    let providers =
+        provider_rows_width(show_claude_code, show_fable, show_codex, show_antigravity, show_kimi);
+    let system = if show_system {
+        system_section_width(system_disk_count(), providers > 0)
+    } else {
+        0
+    };
+    sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + providers + system + sc(RIGHT_MARGIN)
+}
+
+/// Width of the provider block: the wider of row 1 and row 2.
+fn provider_rows_width(
+    show_claude_code: bool,
+    show_fable: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_kimi: bool,
 ) -> i32 {
     let claude_labels: &[&str] = if show_fable {
         &CLAUDE_BAR_LABELS
@@ -1213,7 +1403,8 @@ fn total_widget_width_for_flags(
         sections.push(provider_section_width(&CLAUDE_BAR_LABELS[..2]));
     }
     if sections.is_empty() {
-        sections.push(provider_section_width(&CLAUDE_BAR_LABELS[..2]));
+        // System-stats-only instance: no provider block at all.
+        return 0;
     }
     let row1 = sections[0];
     let row2: i32 = if sections.len() > 1 {
@@ -1221,7 +1412,7 @@ fn total_widget_width_for_flags(
     } else {
         0
     };
-    sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + row1.max(row2) + sc(RIGHT_MARGIN)
+    row1.max(row2)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
@@ -1231,6 +1422,7 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
         state.show_codex,
         state.show_antigravity,
         state.show_kimi,
+        state.show_system,
     )
 }
 
@@ -1239,7 +1431,7 @@ fn total_widget_width() -> i32 {
     state
         .as_ref()
         .map(total_widget_width_for_state)
-        .unwrap_or_else(|| total_widget_width_for_flags(true, true, false, false, false))
+        .unwrap_or_else(|| total_widget_width_for_flags(true, true, false, false, false, true))
 }
 
 fn claude_accent_color() -> Color {
@@ -1312,7 +1504,10 @@ pub fn run() {
     const WAIT_ABANDONED_VALUE: u32 = 0x00000080;
     const WAIT_TIMEOUT_VALUE: u32 = 0x00000102;
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
+    let mutex_name = native_interop::wide_str(&format!(
+        "Global\\ClaudeCodeUsageMonitor{}",
+        profile_suffix()
+    ));
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1390,6 +1585,7 @@ pub fn run() {
             settings.show_codex,
             settings.show_antigravity,
             settings.show_kimi,
+            settings.show_system,
         );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -1464,6 +1660,7 @@ pub fn run() {
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
                 show_kimi: settings.show_kimi,
+                show_system: settings.show_system,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
@@ -1472,9 +1669,11 @@ pub fn run() {
                 auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
                 auth_watch_snapshot: Vec::new(),
                 last_poll_ok: false,
+                reset_poll_attempts: 0,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                wanted_taskbar_index: settings.taskbar_index,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1516,7 +1715,12 @@ pub fn run() {
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
 
-        // Poll timer: 15 minutes
+        // Poll timer: 15 minutes. A system-stats-only instance has no
+        // provider to poll, so it never touches the usage APIs.
+        let has_providers = settings.show_claude_code
+            || settings.show_codex
+            || settings.show_antigravity
+            || settings.show_kimi;
         let initial_poll_ms = {
             let state = lock_state();
             state
@@ -1524,7 +1728,16 @@ pub fn run() {
                 .map(|s| s.poll_interval_ms)
                 .unwrap_or(POLL_15_MIN)
         };
-        SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        if has_providers {
+            SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+        }
+
+        // Local system stats (CPU / RAM / disk / network) every 2 s.
+        if settings.show_system {
+            sysinfo::start_public_ip_refresher();
+            sysinfo::sample();
+            SetTimer(hwnd, TIMER_SYSTEM, SYSTEM_POLL_MS, None);
+        }
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -1534,22 +1747,28 @@ pub fn run() {
         spawn_taskbar_watchdog();
 
         // Initial poll
-        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-        std::thread::spawn(move || {
-            diagnose::log("initial poll thread started");
-            do_poll(send_hwnd);
-        });
+        if has_providers {
+            let send_hwnd = SendHwnd::from_hwnd(hwnd);
+            std::thread::spawn(move || {
+                diagnose::log("initial poll thread started");
+                do_poll(send_hwnd);
+            });
+        }
 
-        schedule_auto_update_check(hwnd);
-        let should_check_updates = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|s| auto_update_check_due(s.last_update_check_unix))
-                .unwrap_or(false)
-        };
-        if should_check_updates {
-            begin_update_check(hwnd, false);
+        // Only the default instance checks for updates; a profile instance
+        // shares the same exe and would just race it.
+        if profile().is_none() {
+            schedule_auto_update_check(hwnd);
+            let should_check_updates = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|s| auto_update_check_due(s.last_update_check_unix))
+                    .unwrap_or(false)
+            };
+            if should_check_updates {
+                begin_update_check(hwnd, false);
+            }
         }
 
         // Initial theme check
@@ -1597,6 +1816,7 @@ fn render_layered() {
         show_codex,
         show_antigravity,
         show_kimi,
+        show_system,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1628,9 +1848,15 @@ fn render_layered() {
                 s.show_codex,
                 s.show_antigravity,
                 s.show_kimi,
+                s.show_system,
             ),
             None => return,
         }
+    };
+    let system = if show_system {
+        sysinfo::latest()
+    } else {
+        None
     };
 
     let hwnd = hwnd_val.to_hwnd();
@@ -1735,6 +1961,8 @@ fn render_layered() {
             &codex_accent,
             &antigravity_accent,
             &kimi_accent,
+            show_system,
+            system.as_ref(),
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1820,6 +2048,8 @@ fn paint_content(
     codex_accent: &Color,
     antigravity_accent: &Color,
     kimi_accent: &Color,
+    show_system: bool,
+    system: Option<&sysinfo::SystemStats>,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -2067,12 +2297,200 @@ fn paint_content(
                 + section.gap;
         }
 
+        // Logged-in Claude account nickname, right-aligned in the free space of row 2.
+        if show_claude_code {
+            if let Some(nick) = claude_account_nick() {
+                let providers_w = provider_rows_width(
+                    show_claude_code,
+                    show_fable,
+                    show_codex,
+                    show_antigravity,
+                    show_kimi,
+                );
+                let mut wide: Vec<u16> = nick.encode_utf16().collect();
+                let mut rect = RECT {
+                    left: row2_x,
+                    top: row2_y,
+                    right: content_x + providers_w,
+                    bottom: row2_y + sc(SEGMENT_H),
+                };
+                if rect.right > rect.left {
+                    let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut wide,
+                        &mut rect,
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+            }
+        }
+
+        if show_system {
+            let providers_w = provider_rows_width(
+                show_claude_code,
+                show_fable,
+                show_codex,
+                show_antigravity,
+                show_kimi,
+            );
+            let sys_x = if providers_w > 0 {
+                let divider_x = content_x + providers_w + sc(SYSTEM_GAP);
+                let divider_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
+                    div_left.0, div_left.1, div_left.2,
+                )));
+                let divider_rect = RECT {
+                    left: divider_x,
+                    top: divider_top,
+                    right: divider_x + sc(SYSTEM_DIVIDER_W),
+                    bottom: divider_bottom,
+                };
+                FillRect(hdc, &divider_rect, divider_brush);
+                let _ = DeleteObject(divider_brush);
+                divider_x + sc(SYSTEM_DIVIDER_W) + sc(SYSTEM_GAP)
+            } else {
+                content_x
+            };
+            draw_system_rows(hdc, sys_x, row1_y, row2_y, system, text_color, is_dark);
+        }
+
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
     }
 }
 
+const CLAUDE_MAIN_ACCOUNT: &str = "artroninnovative@gmail.com";
+
+/// Nickname of the Claude account logged in on this machine ("artron" for the
+/// main account, else the email's first word: sarocha.pao@gmail.com -> sarocha).
+/// Prefers the token's owner from the profile API; falls back to .claude.json
+/// (which can be stale). Re-checks at most once a minute; honours CLAUDE_CONFIG_DIR.
+fn claude_account_nick() -> Option<String> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().ok()?;
+    if let Some((at, nick)) = cache.as_ref() {
+        if at.elapsed() < Duration::from_secs(60) {
+            return nick.clone();
+        }
+    }
+    let path = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir).join(".claude.json"),
+        None => dirs::home_dir()?.join(".claude.json"),
+    };
+    let nick = crate::poller::claude_account_email_cached()
+        .or_else(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .and_then(|v| v["oauthAccount"]["emailAddress"].as_str().map(str::to_string))
+        })
+        .map(|email| {
+            if email == CLAUDE_MAIN_ACCOUNT {
+                "artron".to_string()
+            } else {
+                email.split(['.', '@']).next().unwrap_or(&email).to_string()
+            }
+        });
+    *cache = Some((Instant::now(), nick.clone()));
+    nick
+}
+
+/// Draw one left-aligned text slot of fixed width; returns the x after it.
+fn draw_text_slot(hdc: HDC, x: i32, y: i32, width: i32, text: &str, color: &Color) -> i32 {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut rect = RECT {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + sc(SEGMENT_H),
+    };
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
+    x + width
+}
+
+/// The system-stats block. `None` (no sample yet) renders placeholders so
+/// the widget width doesn't jump when the first sample lands.
+fn draw_system_rows(
+    hdc: HDC,
+    x: i32,
+    row1_y: i32,
+    row2_y: i32,
+    system: Option<&sysinfo::SystemStats>,
+    text_color: &Color,
+    is_dark: bool,
+) {
+    let warn = system_warn_color(is_dark);
+    let gap = sc(SYSTEM_ITEM_GAP);
+    let color_for = |percent: f64| -> Color {
+        if percent >= SYS_WARN_PERCENT {
+            warn
+        } else {
+            *text_color
+        }
+    };
+
+    let (cpu, ram, swap, ip) = match system {
+        Some(s) => (
+            (format!("CPU {:.0}%", s.cpu_percent), color_for(s.cpu_percent)),
+            (format!("RAM {:.0}%", s.ram_percent), color_for(s.ram_percent)),
+            (format!("SWAP {:.0}%", s.swap_percent), color_for(s.swap_percent)),
+            s.ip.clone(),
+        ),
+        None => (
+            ("CPU --".to_string(), *text_color),
+            ("RAM --".to_string(), *text_color),
+            ("SWAP --".to_string(), *text_color),
+            "--".to_string(),
+        ),
+    };
+
+    let mut cur = x;
+    cur = draw_text_slot(hdc, cur, row1_y, sc(SYS_CPU_W), &cpu.0, &cpu.1) + gap;
+    cur = draw_text_slot(hdc, cur, row1_y, sc(SYS_RAM_W), &ram.0, &ram.1) + gap;
+    cur = draw_text_slot(hdc, cur, row1_y, sc(SYS_SWAP_W), &swap.0, &swap.1) + gap;
+    draw_text_slot(hdc, cur, row1_y, sc(SYS_IP_W), &ip, text_color);
+
+    let mut cur = x;
+    match system {
+        Some(s) if !s.disks.is_empty() => {
+            for disk in s.disks.iter().take(sysinfo::MAX_DISKS) {
+                let text = format!("{} {}", disk.label, sysinfo::format_disk(disk));
+                cur = draw_text_slot(hdc, cur, row2_y, sc(SYS_DISK_W), &text, &color_for(disk.percent))
+                    + gap;
+            }
+        }
+        _ => {
+            cur = draw_text_slot(hdc, cur, row2_y, sc(SYS_DISK_W), "C: --", text_color) + gap;
+        }
+    }
+    let (up, down) = match system {
+        Some(s) => (
+            format!("\u{2191}{}", sysinfo::format_rate(s.upload_bps)),
+            format!("\u{2193}{}", sysinfo::format_rate(s.download_bps)),
+        ),
+        None => ("\u{2191}--".to_string(), "\u{2193}--".to_string()),
+    };
+    cur = draw_text_slot(hdc, cur, row2_y, sc(SYS_NET_W), &up, text_color) + gap;
+    draw_text_slot(hdc, cur, row2_y, sc(SYS_NET_W), &down, text_color);
+}
+
 fn do_poll(send_hwnd: SendHwnd) {
+    if POLL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        diagnose::log("poll skipped: previous poll still running");
+        return;
+    }
+    let _in_flight = PollInFlightGuard;
+
     let hwnd = send_hwnd.to_hwnd();
     let (show_claude_code, show_codex, show_antigravity, show_kimi) = {
         let state = lock_state();
@@ -2122,6 +2540,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                 }
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
+                    s.reset_poll_attempts = 0;
                     unsafe {
                         let _ = KillTimer(hwnd, TIMER_RESET_POLL);
                     }
@@ -2304,10 +2723,11 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
+    // If a reset time has passed, poll every 5s to pick up fresh data —
+    // but only for a bounded number of attempts.
+    if poller::app_is_past_reset(data) && s.reset_poll_attempts < MAX_RESET_POLL_ATTEMPTS {
         unsafe {
-            SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
+            SetTimer(hwnd, TIMER_RESET_POLL, RESET_POLL_MS, None);
         }
     }
 
@@ -2456,10 +2876,13 @@ fn position_at_taskbar() {
     let widget_width = total_widget_width();
     let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
     let tray_offset = tray_offset.clamp(0, max_offset);
+    // Persist the clamped offset only on the taskbar the user actually chose:
+    // a fallback taskbar (different width / DPI) would otherwise overwrite the
+    // saved position every time a monitor blinks.
     let offset_changed = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
+            if s.taskbar_index == s.wanted_taskbar_index && s.tray_offset != tray_offset {
                 s.tray_offset = tray_offset;
                 true
             } else {
@@ -2635,11 +3058,24 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
-                        let state = lock_state();
-                        state
-                            .as_ref()
-                            .map(|s| !s.auth_error_paused_polling)
-                            .unwrap_or(false)
+                        let mut state = lock_state();
+                        match state.as_mut() {
+                            Some(s) if s.auth_error_paused_polling => false,
+                            Some(s) if s.reset_poll_attempts >= MAX_RESET_POLL_ATTEMPTS => {
+                                diagnose::log(
+                                    "reset poll: giving up fast polling, data still past reset",
+                                );
+                                unsafe {
+                                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                                }
+                                false
+                            }
+                            Some(s) => {
+                                s.reset_poll_attempts += 1;
+                                true
+                            }
+                            None => false,
+                        }
                     };
                     if should_poll {
                         let sh = SendHwnd::from_hwnd(hwnd);
@@ -2647,6 +3083,10 @@ unsafe extern "system" fn wnd_proc(
                             do_poll(sh);
                         });
                     }
+                }
+                TIMER_SYSTEM => {
+                    sysinfo::sample();
+                    render_layered();
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
@@ -2664,6 +3104,19 @@ unsafe extern "system" fn wnd_proc(
                 TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS,
             ));
             sync_tray_icons(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_REATTACH => {
+            let wanted = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.wanted_taskbar_index).unwrap_or(0)
+            };
+            diagnose::log(format!("re-attaching to preferred taskbar index={wanted}"));
+            if attach_to_taskbar(hwnd, wanted) {
+                position_at_taskbar();
+                render_layered();
+                sync_tray_icons(hwnd);
+            }
             LRESULT(0)
         }
         WM_APP_UPDATE_CHECK_COMPLETE => {
@@ -2832,6 +3285,7 @@ unsafe extern "system" fn wnd_proc(
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
                                 s.tray_offset = new_offset;
+                                s.wanted_taskbar_index = target_index;
                             }
                         }
                         if attach_to_taskbar(hwnd, target_index) {
@@ -2998,6 +3452,35 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                IDM_SHOW_SYSTEM => {
+                    let enabled = {
+                        let mut state = lock_state();
+                        match state.as_mut() {
+                            Some(s) => {
+                                let has_providers = s.show_claude_code
+                                    || s.show_codex
+                                    || s.show_antigravity
+                                    || s.show_kimi;
+                                // Never leave the widget completely empty.
+                                if has_providers || !s.show_system {
+                                    s.show_system = !s.show_system;
+                                }
+                                s.show_system
+                            }
+                            None => false,
+                        }
+                    };
+                    if enabled {
+                        sysinfo::start_public_ip_refresher();
+                        sysinfo::sample();
+                        SetTimer(hwnd, TIMER_SYSTEM, SYSTEM_POLL_MS, None);
+                    } else {
+                        let _ = KillTimer(hwnd, TIMER_SYSTEM);
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
                 | IDM_LANG_DUTCH
@@ -3081,6 +3564,7 @@ fn show_context_menu(hwnd: HWND) {
             show_codex,
             show_antigravity,
             show_kimi,
+            show_system,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -3096,6 +3580,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_codex,
                     s.show_antigravity,
                     s.show_kimi,
+                    s.show_system,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -3109,6 +3594,7 @@ fn show_context_menu(hwnd: HWND) {
                     false,
                     false,
                     false,
+                    true,
                 ),
             }
         };
@@ -3238,6 +3724,19 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        );
+
+        let system_stats_str = native_interop::wide_str(strings.system_stats);
+        let system_stats_flags = if show_system {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            system_stats_flags,
+            IDM_SHOW_SYSTEM as usize,
+            PCWSTR::from_raw(system_stats_str.as_ptr()),
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -3376,6 +3875,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_codex,
         show_antigravity,
         show_kimi,
+        show_system,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -3405,9 +3905,15 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_codex,
                 s.show_antigravity,
                 s.show_kimi,
+                s.show_system,
             ),
             None => return,
         }
+    };
+    let system = if show_system {
+        sysinfo::latest()
+    } else {
+        None
     };
 
     let accent = claude_accent_color();
@@ -3480,6 +3986,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &codex_accent,
             &antigravity_accent,
             &kimi_accent,
+            show_system,
+            system.as_ref(),
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);

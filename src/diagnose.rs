@@ -10,8 +10,9 @@ struct DiagnoseState {
 
 static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
 
-pub fn init() -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join("claude-code-usage-monitor.log");
+/// `suffix` keeps a profile instance's log separate from the default one.
+pub fn init(suffix: &str) -> Result<PathBuf, String> {
+    let path = std::env::temp_dir().join(format!("claude-code-usage-monitor{suffix}.log"));
     let file = OpenOptions::new()
         .create(true)
         .write(true)
